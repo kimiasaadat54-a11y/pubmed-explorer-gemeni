@@ -1,0 +1,6 @@
+{
+  "name": "PubMed Explorer",
+  "description": "Extract scientific articles, journal citations, and historical MeSH terms from PubMed based on subcategories and date ranges.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
