@@ -1,0 +1,8 @@
+{
+  "name": "Remix: pubmed-explorer-gemeni",
+  "description": "Imported from GitHub: kimiasaadat54-a11y/pubmed-explorer-gemeni",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
