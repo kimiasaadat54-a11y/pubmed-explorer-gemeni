@@ -394,6 +394,10 @@ export default function App() {
   const [meshSearchTerm, setMeshSearchTerm] = useState<string>("");
   const [meshSectionTab, setMeshSectionTab] = useState<"ranked" | "graph">("ranked");
 
+  // Collapsible dropdown state for the Trend Chart & MeSH sections
+  const [showTrendChart, setShowTrendChart] = useState<boolean>(false);
+  const [showMeshSection, setShowMeshSection] = useState<boolean>(false);
+
   // DRAFT Filters — bound to the toolbar controls. Nothing here affects a fetch
   // until "Apply Filters" copies these into the APPLIED state above.
   const [draftPaperTypeFilter, setDraftPaperTypeFilter] = useState<string>("all");
@@ -1145,308 +1149,8 @@ export default function App() {
           {/* Search Results Dashboard */}
           {activeTerm && (
             <>
-              {/* Status Bar */}
-              <div className="text-xs mb-6 flex flex-wrap items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/5 backdrop-blur-xl shadow-2xl text-slate-300">
-                <div className="flex items-center gap-2">
-                  {loading ? (
-                    <span className="flex items-center gap-2 font-medium text-blue-400">
-                      <Loader2 size={15} className="animate-spin" /> Fetching PubMed records for page {currentPage}...
-                    </span>
-                  ) : error ? (
-                    <span className="text-red-400 font-medium">{error}</span>
-                  ) : (
-                    <span className="flex items-center gap-2 font-medium text-slate-200">
-                      <Activity size={15} className="text-emerald-400" />
-                      <strong className="font-bold text-white text-sm">{totalCount.toLocaleString()}</strong> historical articles found
-                      {(minYearFilter || maxYearFilter) && (
-                        <span className="text-slate-400 font-mono text-[11px]">
-                          ({minYearFilter || "1900"}–{maxYearFilter || new Date().getFullYear()})
-                        </span>
-                      )}
-                    </span>
-                  )}
-                </div>
-
-                {!loading && totalCount > 0 && (
-                  <div className="flex items-center gap-3">
-                    <span className="font-mono text-[11px] text-slate-400">
-                      {fillModeActive
-                        ? `Page ${currentPage}${pageHasMore ? " (more available)" : " (last page)"} — ${articles.length} matching records`
-                        : `Page ${currentPage} of ${totalPages} (${articles.length} records on page)`}
-                    </span>
-                    <button
-                      onClick={exportToCSV}
-                      className="text-xs px-3 py-1.5 rounded-xl border border-white/10 bg-white/10 hover:bg-white/20 text-white font-medium flex items-center gap-1.5 transition cursor-pointer"
-                      title="Export current page to CSV"
-                    >
-                      <Download size={13} /> Export CSV
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* Publication Volume Trend Chart */}
-              {trendData.length > 0 && (
-                <section className="mb-8 p-5 bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl">
-                  <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-                    <div>
-                      <h2 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
-                        <BarChart2 size={15} className="text-blue-400" /> Relative Publication Volume ({trendMode === "monthly" ? "Monthly" : "Yearly"})
-                      </h2>
-                      <p className="text-xs mt-0.5 text-slate-400">
-                        Proportional research output volume for <strong className="text-blue-300 font-mono">"{activeTerm}"</strong> (Bar lengths represent relative paper count)
-                      </p>
-                    </div>
-
-                    <div className="flex items-center gap-3">
-                      {/* Summary Metrics */}
-                      {(() => {
-                        const counts = trendData.map((d) => d.count || 0);
-                        const maxVal = Math.max(...counts, 1);
-                        const peakItem = trendData.find((d) => d.count === maxVal);
-                        const totalPeriodVal = counts.reduce((a, b) => a + b, 0);
-
-                        return (
-                          <div className="hidden sm:flex items-center gap-3 text-xs bg-slate-900/60 border border-white/10 px-3 py-1.5 rounded-xl font-mono">
-                            <span className="text-slate-400">
-                              Peak: <strong className="text-cyan-300">{peakItem ? `${peakItem.label} (${peakItem.count?.toLocaleString()})` : "—"}</strong>
-                            </span>
-                            <span className="text-slate-600">|</span>
-                            <span className="text-slate-400">
-                              Total Period: <strong className="text-emerald-300">{totalPeriodVal.toLocaleString()}</strong>
-                            </span>
-                          </div>
-                        );
-                      })()}
-
-                      <div className="flex items-center gap-1 bg-white/5 p-1 rounded-xl border border-white/10">
-                        <button
-                          onClick={() => setTrendMode("yearly")}
-                          className={`text-xs px-2.5 py-1 rounded-lg transition font-medium cursor-pointer ${
-                            trendMode === "yearly" ? "bg-blue-600 text-white shadow-sm" : "text-slate-400 hover:text-white"
-                          }`}
-                        >
-                          Yearly
-                        </button>
-                        <button
-                          onClick={() => setTrendMode("monthly")}
-                          className={`text-xs px-2.5 py-1 rounded-lg transition font-medium cursor-pointer ${
-                            trendMode === "monthly" ? "bg-blue-600 text-white shadow-sm" : "text-slate-400 hover:text-white"
-                          }`}
-                        >
-                          Monthly
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-
-                  {trendLoading ? (
-                    <div className="py-12 text-center text-xs text-blue-400 flex items-center justify-center gap-2">
-                      <Loader2 size={16} className="animate-spin" /> Querying NCBI Entrez publication volume across periods...
-                    </div>
-                  ) : (
-                    (() => {
-                      const maxVal = Math.max(...trendData.map((d) => d.count || 0), 1);
-
-                      return (
-                        <div className="relative pt-6 pb-2 px-1">
-                          {/* Relative Percentage Baseline Reference Grid */}
-                          <div className="absolute inset-x-0 top-6 bottom-8 pointer-events-none flex flex-col justify-between text-[10px] font-mono text-slate-600/60">
-                            <div className="border-b border-white/10 w-full flex justify-between pr-2">
-                              <span>100% ({maxVal.toLocaleString()})</span>
-                            </div>
-                            <div className="border-b border-white/5 w-full flex justify-between pr-2">
-                              <span>75% ({Math.round(maxVal * 0.75).toLocaleString()})</span>
-                            </div>
-                            <div className="border-b border-white/5 w-full flex justify-between pr-2">
-                              <span>50% ({Math.round(maxVal * 0.5).toLocaleString()})</span>
-                            </div>
-                            <div className="border-b border-white/5 w-full flex justify-between pr-2">
-                              <span>25% ({Math.round(maxVal * 0.25).toLocaleString()})</span>
-                            </div>
-                            <div className="border-b border-white/10 w-full"></div>
-                          </div>
-
-                          {/* Relative Bar Graph Container */}
-                          <div className="h-48 flex items-end gap-2 pt-2 pb-6 px-4 overflow-x-auto relative z-10">
-                            {trendData.map((pd) => {
-                              const count = pd.count ?? 0;
-                              const pct = Math.round((count / maxVal) * 100);
-                              const isPeak = count === maxVal && maxVal > 0;
-
-                              return (
-                                <div
-                                  key={pd.label}
-                                  onClick={() => {
-                                    if (trendMode === "yearly") {
-                                      setMinYearFilter(pd.label);
-                                      setMaxYearFilter(pd.label);
-                                      setDatePreset("custom");
-                                      setDraftMinYearFilter(pd.label);
-                                      setDraftMaxYearFilter(pd.label);
-                                      setDraftDatePreset("custom");
-                                    }
-                                  }}
-                                  className="flex-1 flex flex-col items-center min-w-[32px] h-full justify-end group cursor-pointer"
-                                  title={`${pd.label}: ${count.toLocaleString()} papers (${pct}% of peak volume). Click to filter table.`}
-                                >
-                                  {/* Paper Count Badge Above Bar */}
-                                  <span
-                                    className={`text-[10px] font-mono px-1.5 py-0.5 rounded mb-1 transition-all whitespace-nowrap ${
-                                      isPeak
-                                        ? "bg-cyan-500/30 text-cyan-200 border border-cyan-400/50 font-bold opacity-100"
-                                        : "bg-slate-800/80 text-slate-300 opacity-80 group-hover:opacity-100 group-hover:scale-110"
-                                    }`}
-                                  >
-                                    {count > 0 ? (count > 9999 ? `${(count / 1000).toFixed(1)}k` : count.toLocaleString()) : "0"}
-                                  </span>
-
-                                  {/* Proportional Relative Bar */}
-                                  <div className="w-full h-full flex items-end bg-slate-800/20 rounded-t-md overflow-hidden p-0.5">
-                                    <div
-                                      style={{ height: `${count === 0 ? 3 : pct}%` }}
-                                      className={`w-full rounded-t-sm transition-all duration-300 ${
-                                        isPeak
-                                          ? "bg-gradient-to-t from-blue-600 via-cyan-400 to-teal-300 shadow-lg shadow-cyan-500/40 brightness-110"
-                                          : "bg-gradient-to-t from-blue-700 via-blue-500 to-cyan-400 opacity-85 group-hover:opacity-100 group-hover:brightness-125"
-                                      }`}
-                                    ></div>
-                                  </div>
-
-                                  {/* Label / Year / Month */}
-                                  <span
-                                    className={`text-[10px] font-mono mt-2 truncate max-w-full transition-colors ${
-                                      isPeak ? "text-cyan-300 font-bold" : "text-slate-400 group-hover:text-white"
-                                    }`}
-                                  >
-                                    {pd.label}
-                                  </span>
-                                </div>
-                              );
-                            })}
-                          </div>
-
-                          <div className="flex items-center justify-between text-[11px] text-slate-400 px-2 pt-1 font-mono">
-                            <span>* Click any bar to drill down into publications for that period</span>
-                            <span className="text-cyan-400">Peak Volume = 100% relative scale</span>
-                          </div>
-                        </div>
-                      );
-                    })()
-                  )}
-                </section>
-              )}
-
-              {/* MeSH Word Frequency & Co-occurrence Analysis Section */}
-              <section className="mb-8 p-5 bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl">
-                <div className="flex flex-wrap items-center justify-between gap-3 mb-4 pb-3 border-b border-white/10">
-                  <div>
-                    <h2 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
-                      <Tag size={15} className="text-cyan-400" /> MeSH Keyword Intelligence ({meshKeywords.length} terms analyzed)
-                    </h2>
-                    <p className="text-xs mt-0.5 text-slate-400">
-                      Top Medical Subject Headings extracted from PubMed abstracts. Click any topic to filter results.
-                    </p>
-                  </div>
-
-                  {/* Mode Switcher Tabs */}
-                  <div className="flex items-center gap-1.5 bg-slate-900/80 p-1 rounded-xl border border-white/10">
-                    <button
-                      onClick={() => setMeshSectionTab("ranked")}
-                      className={`text-xs px-3 py-1.5 rounded-lg transition font-medium cursor-pointer flex items-center gap-1.5 ${
-                        meshSectionTab === "ranked"
-                          ? "bg-gradient-to-r from-blue-600 to-cyan-600 text-white font-bold shadow-md"
-                          : "text-slate-400 hover:text-white"
-                      }`}
-                    >
-                      <ListOrdered size={14} /> Ranked MeSH Terms
-                    </button>
-                    <button
-                      onClick={() => setMeshSectionTab("graph")}
-                      className={`text-xs px-3 py-1.5 rounded-lg transition font-medium cursor-pointer flex items-center gap-1.5 ${
-                        meshSectionTab === "graph"
-                          ? "bg-gradient-to-r from-blue-600 to-cyan-600 text-white font-bold shadow-md"
-                          : "text-slate-400 hover:text-white"
-                      }`}
-                    >
-                      <Network size={14} /> Co-occurrence Network Graph
-                    </button>
-                  </div>
-                </div>
-
-                {meshSectionTab === "ranked" ? (
-                  <RankedMeshList
-                    meshKeywords={meshKeywords}
-                    activeMesh={activeMesh}
-                    onSelectMesh={setActiveMesh}
-                    meshSearchTerm={meshSearchTerm}
-                    onMeshSearchChange={setMeshSearchTerm}
-                    isScanningMesh={isScanningMesh}
-                    meshScanProgress={meshScanProgress}
-                    onScanHistoricalMesh={scanHistoricalMeshTerms}
-                    totalCount={totalCount}
-                    historicalFetchedCount={historicalMeshLists.length}
-                  />
-                ) : (
-                  <MeshCooccurrenceGraph
-                    historicalMeshLists={historicalMeshLists}
-                    activeMesh={activeMesh}
-                    onSelectMesh={setActiveMesh}
-                  />
-                )}
-
-                {(activeMesh || paperTypeFilter !== "all" || journalQualityFilter !== "all" || minCitationsFilter > 0 || minYearFilter || maxYearFilter) && (
-                  <div className="mt-4 pt-3 border-t border-white/10 flex flex-wrap items-center justify-between gap-2 text-xs">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-slate-400 font-semibold flex items-center gap-1">
-                        <Filter size={13} className="text-cyan-400" /> Active Filters:
-                      </span>
-                      {activeMesh && (
-                        <span className="px-2.5 py-1 rounded-full bg-cyan-500/20 text-cyan-200 border border-cyan-400/30 flex items-center gap-1">
-                          MeSH: <strong className="text-white">{activeMesh}</strong>
-                          <button onClick={() => setActiveMesh(null)} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
-                        </span>
-                      )}
-                      {paperTypeFilter !== "all" && (
-                        <span className="px-2.5 py-1 rounded-full bg-indigo-500/20 text-indigo-200 border border-indigo-400/30 flex items-center gap-1">
-                          Type: <strong className="text-white">{PAPER_TYPE_OPTIONS.find(p => p.key === paperTypeFilter)?.label}</strong>
-                          <button onClick={clearPaperTypeFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
-                        </span>
-                      )}
-                      {journalQualityFilter !== "all" && (
-                        <span className="px-2.5 py-1 rounded-full bg-purple-500/20 text-purple-200 border border-purple-400/30 flex items-center gap-1">
-                          Journal Quality: <strong className="text-white">
-                            {journalQualityFilter === "q1" ? "Q1 Flagship" : journalQualityFilter === "q1q2" ? "Q1 & Q2 High Impact" : "Peer-Reviewed"}
-                          </strong>
-                          <button onClick={clearJournalQualityFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
-                        </span>
-                      )}
-                      {minCitationsFilter > 0 && (
-                        <span className="px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-200 border border-amber-400/30 flex items-center gap-1">
-                          Citations: <strong className="text-white">≥ {minCitationsFilter}</strong>
-                          <button onClick={clearMinCitationsFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
-                        </span>
-                      )}
-                      {(minYearFilter || maxYearFilter) && (
-                        <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-400/30 flex items-center gap-1">
-                          Years: <strong className="text-white">{minYearFilter || "1900"} – {maxYearFilter || new Date().getFullYear()}</strong>
-                          <button onClick={clearYearFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
-                        </span>
-                      )}
-                    </div>
-                    <button
-                      onClick={clearAllFilters}
-                      className="text-xs text-slate-400 hover:text-white underline cursor-pointer"
-                    >
-                      Clear All Filters
-                    </button>
-                  </div>
-                )}
-              </section>
-
-              {/* Articles Table with Pagination & Global Filters */}
-              {!loading && sortedArticles.length > 0 && (
-                <section className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl overflow-hidden shadow-2xl mb-8">
+              {/* Filters & Apply */}
+              <section className="mb-8 bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl overflow-hidden shadow-2xl">
                   {/* Table Control & Column Filter Toolbar */}
                   <div className="p-4 border-b border-white/10 bg-slate-900/60 flex flex-wrap items-center justify-between gap-4 text-xs">
                     <div className="flex items-center gap-3 flex-wrap">
@@ -1659,6 +1363,345 @@ export default function App() {
                       </button>
                     </div>
                   </div>
+
+                {(activeMesh || paperTypeFilter !== "all" || journalQualityFilter !== "all" || minCitationsFilter > 0 || minYearFilter || maxYearFilter) && (
+                  <div className="px-4 py-3 border-t border-white/10 bg-slate-900/40 flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-slate-400 font-semibold flex items-center gap-1">
+                        <Filter size={13} className="text-cyan-400" /> Active Filters:
+                      </span>
+                      {activeMesh && (
+                        <span className="px-2.5 py-1 rounded-full bg-cyan-500/20 text-cyan-200 border border-cyan-400/30 flex items-center gap-1">
+                          MeSH: <strong className="text-white">{activeMesh}</strong>
+                          <button onClick={() => setActiveMesh(null)} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
+                        </span>
+                      )}
+                      {paperTypeFilter !== "all" && (
+                        <span className="px-2.5 py-1 rounded-full bg-indigo-500/20 text-indigo-200 border border-indigo-400/30 flex items-center gap-1">
+                          Type: <strong className="text-white">{PAPER_TYPE_OPTIONS.find(p => p.key === paperTypeFilter)?.label}</strong>
+                          <button onClick={clearPaperTypeFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
+                        </span>
+                      )}
+                      {journalQualityFilter !== "all" && (
+                        <span className="px-2.5 py-1 rounded-full bg-purple-500/20 text-purple-200 border border-purple-400/30 flex items-center gap-1">
+                          Journal Quality: <strong className="text-white">
+                            {journalQualityFilter === "q1" ? "Q1 Flagship" : journalQualityFilter === "q1q2" ? "Q1 & Q2 High Impact" : "Peer-Reviewed"}
+                          </strong>
+                          <button onClick={clearJournalQualityFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
+                        </span>
+                      )}
+                      {minCitationsFilter > 0 && (
+                        <span className="px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-200 border border-amber-400/30 flex items-center gap-1">
+                          Citations: <strong className="text-white">≥ {minCitationsFilter}</strong>
+                          <button onClick={clearMinCitationsFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
+                        </span>
+                      )}
+                      {(minYearFilter || maxYearFilter) && (
+                        <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-400/30 flex items-center gap-1">
+                          Years: <strong className="text-white">{minYearFilter || "1900"} – {maxYearFilter || new Date().getFullYear()}</strong>
+                          <button onClick={clearYearFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      onClick={clearAllFilters}
+                      className="text-xs text-slate-400 hover:text-white underline cursor-pointer"
+                    >
+                      Clear All Filters
+                    </button>
+                  </div>
+                )}
+
+              </section>
+
+              {/* Publication Volume Trend Chart (collapsible) */}
+              <section className="mb-8 bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setShowTrendChart((v) => !v)}
+                  className="w-full flex items-center justify-between gap-3 p-5 text-left cursor-pointer hover:bg-white/5 transition"
+                >
+                  <div>
+                    <h2 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                      <BarChart2 size={15} className="text-blue-400" /> Number of Published Papers per Year
+                      {trendLoading && <Loader2 size={12} className="animate-spin text-blue-400" />}
+                    </h2>
+                    <p className="text-xs mt-0.5 text-slate-400">
+                      Click to {showTrendChart ? "hide" : "show"} the publication volume trend chart for <strong className="text-blue-300 font-mono">"{activeTerm}"</strong>
+                    </p>
+                  </div>
+                  {showTrendChart ? <ChevronUp size={16} className="text-slate-400 shrink-0" /> : <ChevronDown size={16} className="text-slate-400 shrink-0" />}
+                </button>
+
+                {showTrendChart && trendData.length === 0 && (
+                  <div className="px-5 pb-5 text-xs text-slate-400">No trend data available yet.</div>
+                )}
+
+                {showTrendChart && trendData.length > 0 && (
+                <div className="px-5 pb-5">
+                  <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                    <div>
+                      <h3 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                        Relative Publication Volume ({trendMode === "monthly" ? "Monthly" : "Yearly"})
+                      </h3>
+                      <p className="text-xs mt-0.5 text-slate-400">
+                        Proportional research output volume for <strong className="text-blue-300 font-mono">"{activeTerm}"</strong> (Bar lengths represent relative paper count)
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-3">
+                      {/* Summary Metrics */}
+                      {(() => {
+                        const counts = trendData.map((d) => d.count || 0);
+                        const maxVal = Math.max(...counts, 1);
+                        const peakItem = trendData.find((d) => d.count === maxVal);
+                        const totalPeriodVal = counts.reduce((a, b) => a + b, 0);
+
+                        return (
+                          <div className="hidden sm:flex items-center gap-3 text-xs bg-slate-900/60 border border-white/10 px-3 py-1.5 rounded-xl font-mono">
+                            <span className="text-slate-400">
+                              Peak: <strong className="text-cyan-300">{peakItem ? `${peakItem.label} (${peakItem.count?.toLocaleString()})` : "—"}</strong>
+                            </span>
+                            <span className="text-slate-600">|</span>
+                            <span className="text-slate-400">
+                              Total Period: <strong className="text-emerald-300">{totalPeriodVal.toLocaleString()}</strong>
+                            </span>
+                          </div>
+                        );
+                      })()}
+
+                      <div className="flex items-center gap-1 bg-white/5 p-1 rounded-xl border border-white/10">
+                        <button
+                          onClick={() => setTrendMode("yearly")}
+                          className={`text-xs px-2.5 py-1 rounded-lg transition font-medium cursor-pointer ${
+                            trendMode === "yearly" ? "bg-blue-600 text-white shadow-sm" : "text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          Yearly
+                        </button>
+                        <button
+                          onClick={() => setTrendMode("monthly")}
+                          className={`text-xs px-2.5 py-1 rounded-lg transition font-medium cursor-pointer ${
+                            trendMode === "monthly" ? "bg-blue-600 text-white shadow-sm" : "text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          Monthly
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {trendLoading ? (
+                    <div className="py-12 text-center text-xs text-blue-400 flex items-center justify-center gap-2">
+                      <Loader2 size={16} className="animate-spin" /> Querying NCBI Entrez publication volume across periods...
+                    </div>
+                  ) : (
+                    (() => {
+                      const maxVal = Math.max(...trendData.map((d) => d.count || 0), 1);
+
+                      return (
+                        <div className="relative pt-6 pb-2 px-1">
+                          {/* Relative Percentage Baseline Reference Grid */}
+                          <div className="absolute inset-x-0 top-6 bottom-8 pointer-events-none flex flex-col justify-between text-[10px] font-mono text-slate-600/60">
+                            <div className="border-b border-white/10 w-full flex justify-between pr-2">
+                              <span>100% ({maxVal.toLocaleString()})</span>
+                            </div>
+                            <div className="border-b border-white/5 w-full flex justify-between pr-2">
+                              <span>75% ({Math.round(maxVal * 0.75).toLocaleString()})</span>
+                            </div>
+                            <div className="border-b border-white/5 w-full flex justify-between pr-2">
+                              <span>50% ({Math.round(maxVal * 0.5).toLocaleString()})</span>
+                            </div>
+                            <div className="border-b border-white/5 w-full flex justify-between pr-2">
+                              <span>25% ({Math.round(maxVal * 0.25).toLocaleString()})</span>
+                            </div>
+                            <div className="border-b border-white/10 w-full"></div>
+                          </div>
+
+                          {/* Relative Bar Graph Container */}
+                          <div className="h-48 flex items-end gap-2 pt-2 pb-6 px-4 overflow-x-auto relative z-10">
+                            {trendData.map((pd) => {
+                              const count = pd.count ?? 0;
+                              const pct = Math.round((count / maxVal) * 100);
+                              const isPeak = count === maxVal && maxVal > 0;
+
+                              return (
+                                <div
+                                  key={pd.label}
+                                  onClick={() => {
+                                    if (trendMode === "yearly") {
+                                      setMinYearFilter(pd.label);
+                                      setMaxYearFilter(pd.label);
+                                      setDatePreset("custom");
+                                      setDraftMinYearFilter(pd.label);
+                                      setDraftMaxYearFilter(pd.label);
+                                      setDraftDatePreset("custom");
+                                    }
+                                  }}
+                                  className="flex-1 flex flex-col items-center min-w-[32px] h-full justify-end group cursor-pointer"
+                                  title={`${pd.label}: ${count.toLocaleString()} papers (${pct}% of peak volume). Click to filter table.`}
+                                >
+                                  {/* Paper Count Badge Above Bar */}
+                                  <span
+                                    className={`text-[10px] font-mono px-1.5 py-0.5 rounded mb-1 transition-all whitespace-nowrap ${
+                                      isPeak
+                                        ? "bg-cyan-500/30 text-cyan-200 border border-cyan-400/50 font-bold opacity-100"
+                                        : "bg-slate-800/80 text-slate-300 opacity-80 group-hover:opacity-100 group-hover:scale-110"
+                                    }`}
+                                  >
+                                    {count > 0 ? (count > 9999 ? `${(count / 1000).toFixed(1)}k` : count.toLocaleString()) : "0"}
+                                  </span>
+
+                                  {/* Proportional Relative Bar */}
+                                  <div className="w-full h-full flex items-end bg-slate-800/20 rounded-t-md overflow-hidden p-0.5">
+                                    <div
+                                      style={{ height: `${count === 0 ? 3 : pct}%` }}
+                                      className={`w-full rounded-t-sm transition-all duration-300 ${
+                                        isPeak
+                                          ? "bg-gradient-to-t from-blue-600 via-cyan-400 to-teal-300 shadow-lg shadow-cyan-500/40 brightness-110"
+                                          : "bg-gradient-to-t from-blue-700 via-blue-500 to-cyan-400 opacity-85 group-hover:opacity-100 group-hover:brightness-125"
+                                      }`}
+                                    ></div>
+                                  </div>
+
+                                  {/* Label / Year / Month */}
+                                  <span
+                                    className={`text-[10px] font-mono mt-2 truncate max-w-full transition-colors ${
+                                      isPeak ? "text-cyan-300 font-bold" : "text-slate-400 group-hover:text-white"
+                                    }`}
+                                  >
+                                    {pd.label}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          <div className="flex items-center justify-between text-[11px] text-slate-400 px-2 pt-1 font-mono">
+                            <span>* Click any bar to drill down into publications for that period</span>
+                            <span className="text-cyan-400">Peak Volume = 100% relative scale</span>
+                          </div>
+                        </div>
+                      );
+                    })()
+                  )}
+                </div>
+                )}
+              </section>
+
+              {/* MeSH Word Frequency & Co-occurrence Analysis Section (collapsible) */}
+              <section className="mb-8 bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setShowMeshSection((v) => !v)}
+                  className="w-full flex items-center justify-between gap-3 p-5 text-left cursor-pointer hover:bg-white/5 transition"
+                >
+                  <div>
+                    <h2 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                      <Tag size={15} className="text-cyan-400" /> MeSH Words ({meshKeywords.length} terms analyzed)
+                    </h2>
+                    <p className="text-xs mt-0.5 text-slate-400">
+                      Click to {showMeshSection ? "hide" : "show"} the top Medical Subject Headings extracted from PubMed abstracts.
+                    </p>
+                  </div>
+                  {showMeshSection ? <ChevronUp size={16} className="text-slate-400 shrink-0" /> : <ChevronDown size={16} className="text-slate-400 shrink-0" />}
+                </button>
+
+                {showMeshSection && (
+                <div className="px-5 pb-5">
+                  <div className="flex items-center justify-end gap-1.5 bg-slate-900/80 p-1 rounded-xl border border-white/10 mb-4 w-fit ml-auto">
+                    <button
+                      onClick={() => setMeshSectionTab("ranked")}
+                      className={`text-xs px-3 py-1.5 rounded-lg transition font-medium cursor-pointer flex items-center gap-1.5 ${
+                        meshSectionTab === "ranked"
+                          ? "bg-gradient-to-r from-blue-600 to-cyan-600 text-white font-bold shadow-md"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <ListOrdered size={14} /> Ranked MeSH Terms
+                    </button>
+                    <button
+                      onClick={() => setMeshSectionTab("graph")}
+                      className={`text-xs px-3 py-1.5 rounded-lg transition font-medium cursor-pointer flex items-center gap-1.5 ${
+                        meshSectionTab === "graph"
+                          ? "bg-gradient-to-r from-blue-600 to-cyan-600 text-white font-bold shadow-md"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <Network size={14} /> Co-occurrence Network Graph
+                    </button>
+                  </div>
+
+                  {meshSectionTab === "ranked" ? (
+                    <RankedMeshList
+                      meshKeywords={meshKeywords}
+                      activeMesh={activeMesh}
+                      onSelectMesh={setActiveMesh}
+                      meshSearchTerm={meshSearchTerm}
+                      onMeshSearchChange={setMeshSearchTerm}
+                      isScanningMesh={isScanningMesh}
+                      meshScanProgress={meshScanProgress}
+                      onScanHistoricalMesh={scanHistoricalMeshTerms}
+                      totalCount={totalCount}
+                      historicalFetchedCount={historicalMeshLists.length}
+                    />
+                  ) : (
+                    <MeshCooccurrenceGraph
+                      historicalMeshLists={historicalMeshLists}
+                      activeMesh={activeMesh}
+                      onSelectMesh={setActiveMesh}
+                    />
+                  )}
+                </div>
+                )}
+              </section>
+
+              {/* Papers Retrieved Summary */}
+              <div className="text-xs mb-6 flex flex-wrap items-center justify-between gap-3 p-4 rounded-xl border border-white/10 bg-white/5 backdrop-blur-xl shadow-2xl text-slate-300">
+                <div className="flex items-center gap-2">
+                  {loading ? (
+                    <span className="flex items-center gap-2 font-medium text-blue-400">
+                      <Loader2 size={15} className="animate-spin" /> Fetching PubMed records for page {currentPage}...
+                    </span>
+                  ) : error ? (
+                    <span className="text-red-400 font-medium">{error}</span>
+                  ) : (
+                    <span className="flex items-center gap-2 font-medium text-slate-200">
+                      <Activity size={15} className="text-emerald-400" />
+                      <strong className="font-bold text-white text-sm">{totalCount.toLocaleString()}</strong> historical articles found{!fillModeActive && totalCount > 0 && (
+                        <span className="text-slate-400 font-mono text-[11px]">in {totalPages.toLocaleString()} page{totalPages === 1 ? "" : "s"}</span>
+                      )}
+                      {(minYearFilter || maxYearFilter) && (
+                        <span className="text-slate-400 font-mono text-[11px]">
+                          ({minYearFilter || "1900"}–{maxYearFilter || new Date().getFullYear()})
+                        </span>
+                      )}
+                    </span>
+                  )}
+                </div>
+
+                {!loading && totalCount > 0 && (
+                  <div className="flex items-center gap-3">
+                    <span className="font-mono text-[11px] text-slate-400">
+                      {fillModeActive
+                        ? `Page ${currentPage}${pageHasMore ? " (more available)" : " (last page)"} — ${articles.length} matching records`
+                        : `Page ${currentPage} of ${totalPages} (${articles.length} records on page)`}
+                    </span>
+                    <button
+                      onClick={exportToCSV}
+                      className="text-xs px-3 py-1.5 rounded-xl border border-white/10 bg-white/10 hover:bg-white/20 text-white font-medium flex items-center gap-1.5 transition cursor-pointer"
+                      title="Export current page to CSV"
+                    >
+                      <Download size={13} /> Export CSV
+                    </button>
+                  </div>
+                )}
+              </div>
+
+
+              {/* Articles Table with Pagination & Global Filters */}
+              {!loading && sortedArticles.length > 0 && (
+                <section className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl overflow-hidden shadow-2xl mb-8">
 
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm border-collapse">
