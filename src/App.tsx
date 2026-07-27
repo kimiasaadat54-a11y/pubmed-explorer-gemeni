@@ -335,6 +335,27 @@ async function fetchTrendCounts(term: string, periods: TrendPeriod[]): Promise<T
   return results;
 }
 
+// Fill-the-page tuning: how many articles to request per PubMed/iCite round trip,
+// and a hard cap on how many rounds a single page-load may take (so a very strict
+// filter with few matches can't spin forever).
+const FILL_CHUNK_SIZE = 50;
+const MAX_FILL_ATTEMPTS_PER_PAGE = 8;
+
+// Journal Quality & Min Citations can't be expressed in the PubMed query itself,
+// so this predicate is what the fill-the-page loop uses to decide whether a
+// candidate article counts toward completing the requested page size.
+function passesJQCitationFilter(
+  a: { citationCount: number | null; journalQuality: JournalQualityInfo },
+  jqFilter: "all" | "q1" | "q1q2" | "peer_reviewed",
+  minCitations: number
+): boolean {
+  if (jqFilter === "q1" && a.journalQuality.tier !== "Q1") return false;
+  if (jqFilter === "q1q2" && a.journalQuality.tier !== "Q1" && a.journalQuality.tier !== "Q2") return false;
+  if (jqFilter === "peer_reviewed" && !a.journalQuality.peerReviewed) return false;
+  if (minCitations > 0 && (a.citationCount ?? 0) < minCitations) return false;
+  return true;
+}
+
 const COLUMNS = [
   { key: "title", label: "Article Title & Authors", sortable: false },
   { key: "paperType", label: "Paper Type", sortable: true },
@@ -360,7 +381,7 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [pageSize, setPageSize] = useState<number>(20);
 
-  // Sorting & Global Filters
+  // Sorting & Global Filters (APPLIED — these drive the actual PubMed fetch / page-fill loop)
   const [sortKey, setSortKey] = useState<string>("year");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [activeMesh, setActiveMesh] = useState<string | null>(null);
@@ -372,6 +393,24 @@ export default function App() {
   const [maxYearFilter, setMaxYearFilter] = useState<string>("");
   const [meshSearchTerm, setMeshSearchTerm] = useState<string>("");
   const [meshSectionTab, setMeshSectionTab] = useState<"ranked" | "graph">("ranked");
+
+  // DRAFT Filters — bound to the toolbar controls. Nothing here affects a fetch
+  // until "Apply Filters" copies these into the APPLIED state above.
+  const [draftPaperTypeFilter, setDraftPaperTypeFilter] = useState<string>("all");
+  const [draftJournalQualityFilter, setDraftJournalQualityFilter] = useState<"all" | "q1" | "q1q2" | "peer_reviewed">("all");
+  const [draftMinCitationsFilter, setDraftMinCitationsFilter] = useState<number>(0);
+  const [draftDatePreset, setDraftDatePreset] = useState<"6m" | "1y" | "2y" | "5y" | "all" | "custom">("6m");
+  const [draftMinYearFilter, setDraftMinYearFilter] = useState<string>("");
+  const [draftMaxYearFilter, setDraftMaxYearFilter] = useState<string>("");
+
+  // Fill-the-page pagination state. Journal Quality & Min Citations can't be
+  // expressed in the PubMed query (JQ is our own list, citations come from a
+  // separate iCite call) so satisfying them requires scanning forward through
+  // the underlying unfiltered result set until a full page of matches is found.
+  const scanCursorRef = useRef<{ retstart: number; buffer: Article[] }>({ retstart: 0, buffer: [] });
+  const pageCacheRef = useRef<Map<number, { articles: Article[]; hasMore: boolean; hitCap: boolean }>>(new Map());
+  const [pageHasMore, setPageHasMore] = useState<boolean>(true);
+  const [pageHitCap, setPageHitCap] = useState<boolean>(false);
 
   // MeSH Historical Extraction State
   const [historicalMeshLists, setHistoricalMeshLists] = useState<string[][]>([]);
@@ -403,6 +442,8 @@ export default function App() {
     yTo: string,
     sKey: string,
     sDir: "asc" | "desc",
+    jqFilter: "all" | "q1" | "q1q2" | "peer_reviewed",
+    citFilter: number,
     page: number = 1
   ) => {
     setLoading(true);
@@ -411,6 +452,12 @@ export default function App() {
     setActiveSub(sub);
     setActiveTerm(term);
     setCurrentPage(page);
+
+    // A fresh query invalidates any in-progress page-fill scan/cache.
+    scanCursorRef.current = { retstart: 0, buffer: [] };
+    pageCacheRef.current = new Map();
+    setPageHasMore(true);
+    setPageHitCap(false);
 
     // Build composite term query for NCBI PubMed esearch
     let compositeTerm = term;
@@ -470,7 +517,7 @@ export default function App() {
         return;
       }
 
-      await fetchArticlePage(page, pageSize, env, key, total);
+      await fetchArticlePage(page, pageSize, env, key, total, jqFilter, citFilter);
     } catch (e) {
       console.error("PubMed search error:", e);
       setError("Unable to connect to PubMed. Please check your connection or try again.");
@@ -482,41 +529,108 @@ export default function App() {
     }
   }, [pageSize]);
 
-  // Fetch Page of Articles using Entrez History WebEnv & query_key
-  const fetchArticlePage = async (page: number, size: number, env: string, key: string, total: number) => {
+  // Fetch + parse one chunk of PubMed records starting at `retstart`, attach iCite
+  // citation metrics, and return the fully-built Article objects. Shared by both
+  // the fast unfiltered path and the fill-the-page loop below.
+  const fetchArticleChunk = async (
+    env: string,
+    key: string,
+    retstart: number,
+    retmax: number
+  ): Promise<Article[]> => {
+    const efetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&rettype=abstract&retmode=xml&query_key=${key}&WebEnv=${env}&retstart=${retstart}&retmax=${retmax}`;
+    const xmlText = await fetchWithRetry<string>(efetchUrl, 3, "text");
+    const parsedArticles = parseArticleXML(xmlText);
+
+    const pmids = parsedArticles.map((a) => a.pmid).filter(Boolean);
+    const iciteMetrics = await fetchICiteMetrics(pmids);
+
+    const completeArticles: Article[] = parsedArticles.map((a) => {
+      const jQuality = getJournalQualityInfo(a.journal);
+      const citeData = iciteMetrics.get(a.pmid);
+      return {
+        ...a,
+        citationCount: citeData?.citationCount ?? null,
+        rcr: citeData?.rcr ?? null,
+        journalQuality: jQuality,
+      };
+    });
+
+    // Every article scanned (whether it ends up passing JQ/citation filters or
+    // not) contributes to the MeSH intelligence corpus — that section reflects
+    // the whole topic, not just what happens to be on the current page.
+    const newMeshLists = parsedArticles.map((a) => a.meshTerms);
+    setHistoricalMeshLists((prev) => [...prev, ...newMeshLists]);
+
+    return completeArticles;
+  };
+
+  // Fetch a page of articles using Entrez History WebEnv & query_key.
+  // - When Journal Quality / Min Citations filters are OFF, this is a single
+  //   direct fetch at retstart=(page-1)*size — exact, cheap, unchanged from before.
+  // - When either filter is ON, PubMed can't apply them for us, so this scans
+  //   forward in chunks — carrying a cursor + leftover-match buffer across page
+  //   turns — until the page is full or the whole result set is exhausted.
+  const fetchArticlePage = async (
+    page: number,
+    size: number,
+    env: string,
+    key: string,
+    total: number,
+    jqFilter: "all" | "q1" | "q1q2" | "peer_reviewed",
+    citFilter: number
+  ) => {
+    const fillModeActive = jqFilter !== "all" || citFilter > 0;
+
     setLoading(true);
     setError(null);
 
-    const retstart = (page - 1) * size;
-    const retmax = size;
-    const efetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&rettype=abstract&retmode=xml&query_key=${key}&WebEnv=${env}&retstart=${retstart}&retmax=${retmax}`;
-
     try {
-      const xmlText = await fetchWithRetry<string>(efetchUrl, 3, "text");
-      const parsedArticles = parseArticleXML(xmlText);
+      if (!fillModeActive) {
+        const retstart = (page - 1) * size;
+        const chunk = await fetchArticleChunk(env, key, retstart, size);
+        setArticles(chunk);
+        setCurrentPage(page);
+        setPageHasMore(retstart + size < total);
+        setPageHitCap(false);
+        return;
+      }
 
-      // Collect PMIDs to fetch citations from NIH iCite
-      const pmids = parsedArticles.map((a) => a.pmid).filter(Boolean);
-      const iciteMetrics = await fetchICiteMetrics(pmids);
+      // Filtered ("fill the page") mode.
+      const cached = pageCacheRef.current.get(page);
+      if (cached) {
+        setArticles(cached.articles);
+        setCurrentPage(page);
+        setPageHasMore(cached.hasMore);
+        setPageHitCap(cached.hitCap);
+        return;
+      }
 
-      const completeArticles: Article[] = parsedArticles.map((a) => {
-        const jQuality = getJournalQualityInfo(a.journal);
-        const citeData = iciteMetrics.get(a.pmid);
-        return {
-          ...a,
-          citationCount: citeData?.citationCount ?? null,
-          rcr: citeData?.rcr ?? null,
-          journalQuality: jQuality,
-        };
-      });
+      let { retstart, buffer } = scanCursorRef.current;
+      let attempts = 0;
+      let exhausted = retstart >= total;
 
-      setArticles(completeArticles);
+      while (buffer.length < size && attempts < MAX_FILL_ATTEMPTS_PER_PAGE && retstart < total) {
+        const retmax = Math.min(FILL_CHUNK_SIZE, total - retstart);
+        const chunk = await fetchArticleChunk(env, key, retstart, retmax);
+        buffer = [...buffer, ...chunk.filter((a) => passesJQCitationFilter(a, jqFilter, citFilter))];
+        retstart += retmax;
+        attempts += 1;
+        if (retstart >= total) exhausted = true;
+      }
+
+      const pageArticles = buffer.slice(0, size);
+      const overflow = buffer.slice(size);
+      const hasMore = overflow.length > 0 || retstart < total;
+      const hitCap = pageArticles.length < size && !exhausted;
+
+      scanCursorRef.current = { retstart, buffer: overflow };
+      pageCacheRef.current.set(page, { articles: pageArticles, hasMore, hitCap });
+
+      setArticles(pageArticles);
       setCurrentPage(page);
-
-      // Append new MeSH lists to historical memory
-      const newMeshLists = parsedArticles.map(a => a.meshTerms);
-      setHistoricalMeshLists(prev => [...prev, ...newMeshLists]);
-
+      setPageHasMore(hasMore);
+      setPageHitCap(hitCap);
     } catch (e) {
       console.error("Fetch page error:", e);
       setError("Failed to fetch article page from PubMed.");
@@ -561,22 +675,33 @@ export default function App() {
     }
   };
 
+  // Whether the fill-the-page loop is needed at all (JQ / Min Citations active).
+  const fillModeActive = journalQualityFilter !== "all" || minCitationsFilter > 0;
+
   // Page Navigation Handlers
   const handlePageChange = (newPage: number) => {
-    if (newPage < 1 || newPage > totalPages || newPage === currentPage || !webEnv || !queryKey) return;
-    fetchArticlePage(newPage, pageSize, webEnv, queryKey, totalCount);
+    if (newPage < 1 || newPage === currentPage || !webEnv || !queryKey) return;
+    if (fillModeActive) {
+      if (newPage > currentPage && !pageHasMore) return; // scan already exhausted
+    } else {
+      if (newPage > totalPages) return;
+    }
+    fetchArticlePage(newPage, pageSize, webEnv, queryKey, totalCount, journalQualityFilter, minCitationsFilter);
   };
 
   const handlePageSizeChange = (newSize: number) => {
     setPageSize(newSize);
+    scanCursorRef.current = { retstart: 0, buffer: [] };
+    pageCacheRef.current = new Map();
     if (webEnv && queryKey && totalCount > 0) {
-      fetchArticlePage(1, newSize, webEnv, queryKey, totalCount);
+      fetchArticlePage(1, newSize, webEnv, queryKey, totalCount, journalQualityFilter, minCitationsFilter);
     }
   };
 
   const totalPages = useMemo(() => Math.max(1, Math.ceil(totalCount / pageSize)), [totalCount, pageSize]);
 
-  // Trigger search when query term, MeSH, Paper Type, Date Preset, Year Range or Sorting changes across ALL data
+  // Trigger search when query term, MeSH, Paper Type, Date Preset, Year Range, JQ/Citation
+  // filters, or Sorting changes across ALL data
   useEffect(() => {
     if (activeTerm) {
       executePubMedSearch(
@@ -590,6 +715,8 @@ export default function App() {
         maxYearFilter,
         sortKey,
         sortDir,
+        journalQualityFilter,
+        minCitationsFilter,
         1
       );
     }
@@ -603,6 +730,8 @@ export default function App() {
     maxYearFilter,
     sortKey,
     sortDir,
+    journalQualityFilter,
+    minCitationsFilter,
   ]);
 
   // Load Trend Counts
@@ -631,6 +760,12 @@ export default function App() {
     setDatePreset("6m");
     setMinYearFilter("");
     setMaxYearFilter("");
+    setDraftPaperTypeFilter("all");
+    setDraftJournalQualityFilter("all");
+    setDraftMinCitationsFilter(0);
+    setDraftDatePreset("6m");
+    setDraftMinYearFilter("");
+    setDraftMaxYearFilter("");
     setArticles([]);
     setTotalCount(0);
     setError(null);
@@ -646,6 +781,12 @@ export default function App() {
     setDatePreset("6m");
     setMinYearFilter("");
     setMaxYearFilter("");
+    setDraftPaperTypeFilter("all");
+    setDraftJournalQualityFilter("all");
+    setDraftMinCitationsFilter(0);
+    setDraftDatePreset("6m");
+    setDraftMinYearFilter("");
+    setDraftMaxYearFilter("");
     setHistoricalMeshLists([]);
     executePubMedSearch(
       sub.query,
@@ -658,6 +799,8 @@ export default function App() {
       "",
       sortKey,
       sortDir,
+      "all",
+      0,
       1
     );
   };
@@ -673,6 +816,12 @@ export default function App() {
     setDatePreset("6m");
     setMinYearFilter("");
     setMaxYearFilter("");
+    setDraftPaperTypeFilter("all");
+    setDraftJournalQualityFilter("all");
+    setDraftMinCitationsFilter(0);
+    setDraftDatePreset("6m");
+    setDraftMinYearFilter("");
+    setDraftMaxYearFilter("");
     setHistoricalMeshLists([]);
     executePubMedSearch(
       term,
@@ -685,8 +834,43 @@ export default function App() {
       "",
       sortKey,
       sortDir,
+      "all",
+      0,
       1
     );
+  };
+
+  // Apply Filters — commits the draft toolbar state into the applied state that
+  // actually drives the fetch. Nothing above this line touches the network.
+  const filtersDirty =
+    draftPaperTypeFilter !== paperTypeFilter ||
+    draftJournalQualityFilter !== journalQualityFilter ||
+    draftMinCitationsFilter !== minCitationsFilter ||
+    draftDatePreset !== datePreset ||
+    draftMinYearFilter !== minYearFilter ||
+    draftMaxYearFilter !== maxYearFilter;
+
+  const applyFilters = () => {
+    setPaperTypeFilter(draftPaperTypeFilter);
+    setJournalQualityFilter(draftJournalQualityFilter);
+    setMinCitationsFilter(draftMinCitationsFilter);
+    setDatePreset(draftDatePreset);
+    setMinYearFilter(draftMinYearFilter);
+    setMaxYearFilter(draftMaxYearFilter);
+  };
+
+  // Used by the "Active Filters" chips (below the toolbar) — removing a chip
+  // there is a direct, immediate action, so it updates draft + applied together.
+  const clearPaperTypeFilter = () => { setPaperTypeFilter("all"); setDraftPaperTypeFilter("all"); };
+  const clearJournalQualityFilter = () => { setJournalQualityFilter("all"); setDraftJournalQualityFilter("all"); };
+  const clearMinCitationsFilter = () => { setMinCitationsFilter(0); setDraftMinCitationsFilter(0); };
+  const clearYearFilter = () => { setMinYearFilter(""); setMaxYearFilter(""); setDraftMinYearFilter(""); setDraftMaxYearFilter(""); };
+  const clearAllFilters = () => {
+    setActiveMesh(null);
+    clearPaperTypeFilter();
+    clearJournalQualityFilter();
+    clearMinCitationsFilter();
+    clearYearFilter();
   };
 
   // MeSH Frequency calculation across all historical extracted lists
@@ -986,7 +1170,9 @@ export default function App() {
                 {!loading && totalCount > 0 && (
                   <div className="flex items-center gap-3">
                     <span className="font-mono text-[11px] text-slate-400">
-                      Page {currentPage} of {totalPages} ({articles.length} records on page)
+                      {fillModeActive
+                        ? `Page ${currentPage}${pageHasMore ? " (more available)" : " (last page)"} — ${articles.length} matching records`
+                        : `Page ${currentPage} of ${totalPages} (${articles.length} records on page)`}
                     </span>
                     <button
                       onClick={exportToCSV}
@@ -1096,6 +1282,9 @@ export default function App() {
                                       setMinYearFilter(pd.label);
                                       setMaxYearFilter(pd.label);
                                       setDatePreset("custom");
+                                      setDraftMinYearFilter(pd.label);
+                                      setDraftMaxYearFilter(pd.label);
+                                      setDraftDatePreset("custom");
                                     }
                                   }}
                                   className="flex-1 flex flex-col items-center min-w-[32px] h-full justify-end group cursor-pointer"
@@ -1221,7 +1410,7 @@ export default function App() {
                       {paperTypeFilter !== "all" && (
                         <span className="px-2.5 py-1 rounded-full bg-indigo-500/20 text-indigo-200 border border-indigo-400/30 flex items-center gap-1">
                           Type: <strong className="text-white">{PAPER_TYPE_OPTIONS.find(p => p.key === paperTypeFilter)?.label}</strong>
-                          <button onClick={() => setPaperTypeFilter("all")} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
+                          <button onClick={clearPaperTypeFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
                         </span>
                       )}
                       {journalQualityFilter !== "all" && (
@@ -1229,31 +1418,24 @@ export default function App() {
                           Journal Quality: <strong className="text-white">
                             {journalQualityFilter === "q1" ? "Q1 Flagship" : journalQualityFilter === "q1q2" ? "Q1 & Q2 High Impact" : "Peer-Reviewed"}
                           </strong>
-                          <button onClick={() => setJournalQualityFilter("all")} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
+                          <button onClick={clearJournalQualityFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
                         </span>
                       )}
                       {minCitationsFilter > 0 && (
                         <span className="px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-200 border border-amber-400/30 flex items-center gap-1">
                           Citations: <strong className="text-white">≥ {minCitationsFilter}</strong>
-                          <button onClick={() => setMinCitationsFilter(0)} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
+                          <button onClick={clearMinCitationsFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
                         </span>
                       )}
                       {(minYearFilter || maxYearFilter) && (
                         <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-400/30 flex items-center gap-1">
                           Years: <strong className="text-white">{minYearFilter || "1900"} – {maxYearFilter || new Date().getFullYear()}</strong>
-                          <button onClick={() => { setMinYearFilter(""); setMaxYearFilter(""); }} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
+                          <button onClick={clearYearFilter} className="ml-1 hover:text-white cursor-pointer"><X size={12} /></button>
                         </span>
                       )}
                     </div>
                     <button
-                      onClick={() => {
-                        setActiveMesh(null);
-                        setPaperTypeFilter("all");
-                        setJournalQualityFilter("all");
-                        setMinCitationsFilter(0);
-                        setMinYearFilter("");
-                        setMaxYearFilter("");
-                      }}
+                      onClick={clearAllFilters}
                       className="text-xs text-slate-400 hover:text-white underline cursor-pointer"
                     >
                       Clear All Filters
@@ -1273,8 +1455,8 @@ export default function App() {
                         <FileText size={14} className="text-indigo-400 shrink-0" />
                         <span className="font-bold text-slate-300">Paper Type:</span>
                         <select
-                          value={paperTypeFilter}
-                          onChange={(e) => setPaperTypeFilter(e.target.value)}
+                          value={draftPaperTypeFilter}
+                          onChange={(e) => setDraftPaperTypeFilter(e.target.value)}
                           className="bg-transparent text-xs text-slate-200 outline-none max-w-[200px] cursor-pointer font-medium"
                         >
                           {PAPER_TYPE_OPTIONS.map((option) => (
@@ -1283,8 +1465,8 @@ export default function App() {
                             </option>
                           ))}
                         </select>
-                        {paperTypeFilter !== "all" && (
-                          <button onClick={() => setPaperTypeFilter("all")} className="text-slate-400 hover:text-white ml-1 cursor-pointer">
+                        {draftPaperTypeFilter !== "all" && (
+                          <button onClick={() => setDraftPaperTypeFilter("all")} className="text-slate-400 hover:text-white ml-1 cursor-pointer">
                             <X size={12} />
                           </button>
                         )}
@@ -1295,8 +1477,8 @@ export default function App() {
                         <ShieldCheck size={14} className="text-purple-400 shrink-0" />
                         <span className="font-bold text-slate-300">Journal Quality:</span>
                         <select
-                          value={journalQualityFilter}
-                          onChange={(e) => setJournalQualityFilter(e.target.value as any)}
+                          value={draftJournalQualityFilter}
+                          onChange={(e) => setDraftJournalQualityFilter(e.target.value as any)}
                           className="bg-transparent text-xs text-slate-200 outline-none cursor-pointer font-medium"
                         >
                           <option value="all" className="bg-slate-900 text-slate-200">All Tiers & Quality Levels</option>
@@ -1304,8 +1486,8 @@ export default function App() {
                           <option value="q1q2" className="bg-slate-900 text-slate-200">Q1 & Q2 High Impact Tiers</option>
                           <option value="peer_reviewed" className="bg-slate-900 text-slate-200">Peer-Reviewed Journals</option>
                         </select>
-                        {journalQualityFilter !== "all" && (
-                          <button onClick={() => setJournalQualityFilter("all")} className="text-slate-400 hover:text-white ml-1 cursor-pointer">
+                        {draftJournalQualityFilter !== "all" && (
+                          <button onClick={() => setDraftJournalQualityFilter("all")} className="text-slate-400 hover:text-white ml-1 cursor-pointer">
                             <X size={12} />
                           </button>
                         )}
@@ -1320,10 +1502,10 @@ export default function App() {
                             type="number"
                             min="0"
                             placeholder="0"
-                            value={minCitationsFilter === 0 ? "" : minCitationsFilter}
+                            value={draftMinCitationsFilter === 0 ? "" : draftMinCitationsFilter}
                             onChange={(e) => {
                               const val = parseInt(e.target.value, 10);
-                              setMinCitationsFilter(isNaN(val) || val < 0 ? 0 : val);
+                              setDraftMinCitationsFilter(isNaN(val) || val < 0 ? 0 : val);
                             }}
                             className="w-16 bg-slate-800/80 border border-white/20 rounded px-2 py-0.5 text-xs text-amber-300 font-bold outline-none focus:border-amber-400 text-center"
                           />
@@ -1333,9 +1515,9 @@ export default function App() {
                           {[0, 10, 50, 100].map((preset) => (
                             <button
                               key={preset}
-                              onClick={() => setMinCitationsFilter(preset)}
+                              onClick={() => setDraftMinCitationsFilter(preset)}
                               className={`text-[10px] px-1.5 py-0.5 rounded transition cursor-pointer font-semibold ${
-                                minCitationsFilter === preset
+                                draftMinCitationsFilter === preset
                                   ? "bg-amber-500 text-slate-950 font-bold"
                                   : "bg-white/5 text-slate-400 hover:text-white"
                               }`}
@@ -1344,8 +1526,8 @@ export default function App() {
                             </button>
                           ))}
                         </div>
-                        {minCitationsFilter > 0 && (
-                          <button onClick={() => setMinCitationsFilter(0)} className="text-slate-400 hover:text-white ml-1 cursor-pointer">
+                        {draftMinCitationsFilter > 0 && (
+                          <button onClick={() => setDraftMinCitationsFilter(0)} className="text-slate-400 hover:text-white ml-1 cursor-pointer">
                             <X size={12} />
                           </button>
                         )}
@@ -1356,8 +1538,8 @@ export default function App() {
                         <Calendar size={14} className="text-emerald-400 shrink-0" />
                         <span className="font-bold text-slate-300">Year Column:</span>
                         <select
-                          value={minYearFilter}
-                          onChange={(e) => setMinYearFilter(e.target.value)}
+                          value={draftMinYearFilter}
+                          onChange={(e) => setDraftMinYearFilter(e.target.value)}
                           className="bg-transparent text-xs text-slate-200 outline-none cursor-pointer font-medium"
                         >
                           <option value="" className="bg-slate-900 text-slate-200">From Min</option>
@@ -1367,8 +1549,8 @@ export default function App() {
                         </select>
                         <span className="text-slate-500">–</span>
                         <select
-                          value={maxYearFilter}
-                          onChange={(e) => setMaxYearFilter(e.target.value)}
+                          value={draftMaxYearFilter}
+                          onChange={(e) => setDraftMaxYearFilter(e.target.value)}
                           className="bg-transparent text-xs text-slate-200 outline-none cursor-pointer font-medium"
                         >
                           <option value="" className="bg-slate-900 text-slate-200">To Max</option>
@@ -1376,8 +1558,8 @@ export default function App() {
                             <option key={y} value={y} className="bg-slate-900 text-slate-200">{y}</option>
                           ))}
                         </select>
-                        {(minYearFilter || maxYearFilter) && (
-                          <button onClick={() => { setMinYearFilter(""); setMaxYearFilter(""); }} className="text-slate-400 hover:text-white ml-1 cursor-pointer">
+                        {(draftMinYearFilter || draftMaxYearFilter) && (
+                          <button onClick={() => { setDraftMinYearFilter(""); setDraftMaxYearFilter(""); }} className="text-slate-400 hover:text-white ml-1 cursor-pointer">
                             <X size={12} />
                           </button>
                         )}
@@ -1387,12 +1569,12 @@ export default function App() {
                       <div className="flex items-center gap-1">
                         <button
                           onClick={() => {
-                            setDatePreset("6m");
-                            setMinYearFilter("");
-                            setMaxYearFilter("");
+                            setDraftDatePreset("6m");
+                            setDraftMinYearFilter("");
+                            setDraftMaxYearFilter("");
                           }}
                           className={`text-[11px] px-2.5 py-1 rounded-lg border transition cursor-pointer ${
-                            datePreset === "6m" && !minYearFilter && !maxYearFilter
+                            draftDatePreset === "6m" && !draftMinYearFilter && !draftMaxYearFilter
                               ? "bg-emerald-600/50 border-emerald-400/50 text-white font-bold shadow-sm"
                               : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
                           }`}
@@ -1401,12 +1583,12 @@ export default function App() {
                         </button>
                         <button
                           onClick={() => {
-                            setDatePreset("1y");
-                            setMinYearFilter("");
-                            setMaxYearFilter("");
+                            setDraftDatePreset("1y");
+                            setDraftMinYearFilter("");
+                            setDraftMaxYearFilter("");
                           }}
                           className={`text-[11px] px-2.5 py-1 rounded-lg border transition cursor-pointer ${
-                            datePreset === "1y" && !minYearFilter && !maxYearFilter
+                            draftDatePreset === "1y" && !draftMinYearFilter && !draftMaxYearFilter
                               ? "bg-emerald-600/50 border-emerald-400/50 text-white font-bold shadow-sm"
                               : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
                           }`}
@@ -1415,12 +1597,12 @@ export default function App() {
                         </button>
                         <button
                           onClick={() => {
-                            setDatePreset("2y");
-                            setMinYearFilter("");
-                            setMaxYearFilter("");
+                            setDraftDatePreset("2y");
+                            setDraftMinYearFilter("");
+                            setDraftMaxYearFilter("");
                           }}
                           className={`text-[11px] px-2.5 py-1 rounded-lg border transition cursor-pointer ${
-                            datePreset === "2y" && !minYearFilter && !maxYearFilter
+                            draftDatePreset === "2y" && !draftMinYearFilter && !draftMaxYearFilter
                               ? "bg-emerald-600/50 border-emerald-400/50 text-white font-bold shadow-sm"
                               : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
                           }`}
@@ -1429,12 +1611,12 @@ export default function App() {
                         </button>
                         <button
                           onClick={() => {
-                            setDatePreset("5y");
-                            setMinYearFilter("");
-                            setMaxYearFilter("");
+                            setDraftDatePreset("5y");
+                            setDraftMinYearFilter("");
+                            setDraftMaxYearFilter("");
                           }}
                           className={`text-[11px] px-2.5 py-1 rounded-lg border transition cursor-pointer ${
-                            datePreset === "5y" && !minYearFilter && !maxYearFilter
+                            draftDatePreset === "5y" && !draftMinYearFilter && !draftMaxYearFilter
                               ? "bg-emerald-600/50 border-emerald-400/50 text-white font-bold shadow-sm"
                               : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
                           }`}
@@ -1443,12 +1625,12 @@ export default function App() {
                         </button>
                         <button
                           onClick={() => {
-                            setDatePreset("all");
-                            setMinYearFilter("");
-                            setMaxYearFilter("");
+                            setDraftDatePreset("all");
+                            setDraftMinYearFilter("");
+                            setDraftMaxYearFilter("");
                           }}
                           className={`text-[11px] px-2.5 py-1 rounded-lg border transition cursor-pointer ${
-                            datePreset === "all" && !minYearFilter && !maxYearFilter
+                            draftDatePreset === "all" && !draftMinYearFilter && !draftMaxYearFilter
                               ? "bg-emerald-600/50 border-emerald-400/50 text-white font-bold shadow-sm"
                               : "bg-white/5 border-white/10 text-slate-400 hover:text-white"
                           }`}
@@ -1458,8 +1640,23 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="text-slate-400 font-mono text-[11px]">
-                      Showing <strong className="text-white">{sortedArticles.length}</strong> matching PubMed articles
+                    <div className="flex items-center gap-3">
+                      {filtersDirty && (
+                        <span className="text-[11px] text-amber-300 font-medium flex items-center gap-1">
+                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" /> Unapplied changes
+                        </span>
+                      )}
+                      <button
+                        onClick={applyFilters}
+                        disabled={!filtersDirty}
+                        className={`text-xs px-4 py-2 rounded-xl font-bold flex items-center gap-1.5 transition cursor-pointer shadow-lg ${
+                          filtersDirty
+                            ? "bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white shadow-cyan-950/40"
+                            : "bg-white/5 text-slate-500 border border-white/10 cursor-not-allowed shadow-none"
+                        }`}
+                      >
+                        <Filter size={13} /> Apply Filters
+                      </button>
                     </div>
                   </div>
 
@@ -1646,18 +1843,27 @@ export default function App() {
                       </button>
 
                       <span className="text-xs font-mono text-slate-300 px-2">
-                        Page {currentPage} of {totalPages}
+                        {fillModeActive ? `Page ${currentPage}${pageHasMore ? "" : " (last)"}` : `Page ${currentPage} of ${totalPages}`}
                       </span>
 
                       <button
                         onClick={() => handlePageChange(currentPage + 1)}
-                        disabled={currentPage === totalPages}
+                        disabled={fillModeActive ? !pageHasMore : currentPage === totalPages}
                         className="p-1.5 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-slate-300 disabled:opacity-30 cursor-pointer disabled:cursor-not-allowed transition"
                       >
                         <ChevronRight size={16} />
                       </button>
                     </div>
                   </div>
+
+                  {fillModeActive && pageHitCap && (
+                    <div className="px-4 pb-4 -mt-2 bg-white/5">
+                      <p className="text-[11px] text-amber-300/90 flex items-center gap-1.5">
+                        <Info size={12} className="shrink-0" />
+                        Only {articles.length} matching article{articles.length === 1 ? "" : "s"} found in the records scanned so far for this page — click <ChevronRight size={11} className="inline" /> to keep searching for more matches.
+                      </p>
+                    </div>
+                  )}
                 </section>
               )}
 
