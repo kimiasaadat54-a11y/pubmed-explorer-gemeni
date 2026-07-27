@@ -338,7 +338,7 @@ async function fetchTrendCounts(term: string, periods: TrendPeriod[]): Promise<T
 // Fill-the-page tuning: how many articles to request per PubMed/iCite round trip,
 // and a hard cap on how many rounds a single page-load may take (so a very strict
 // filter with few matches can't spin forever).
-const FILL_CHUNK_SIZE = 50;
+const FILL_CHUNK_SIZE = 100;
 const MAX_FILL_ATTEMPTS_PER_PAGE = 8;
 
 // Journal Quality & Min Citations can't be expressed in the PubMed query itself,
